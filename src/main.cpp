@@ -236,7 +236,7 @@ void icp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
     my_kd_tree_t mat_index(3, std::cref(mat2), 10 /* max leaf */);
     mat_index.index->buildIndex();
     Mat rotation_matrix = Mat::eye(3, 3, CV_64F);
-    Mat translation_matrix = Mat::eye(3, 1, CV_64F);
+    Mat translation_matrix = Mat::zeros(3, 1, CV_64F);
     for (int iters_ = 0; iters_ < max_iters_; iters_++) {
         findNearestNeighbours(cvSource, mat_index, cvSource.rows, 3);
         Mat cvNewTarget = Mat::zeros(cvSource.rows, 3, CV_64F);
@@ -296,7 +296,7 @@ void tricp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
     int max_iters_ = max_iteration_num;//100;
     my_kd_tree_t mat_index(3, std::cref(mat2), 10 /* max leaf */);
     Mat rotation_matrix = Mat::eye(3, 3, CV_64F);
-    Mat translation_matrix = Mat::eye(3, 1, CV_64F);
+    Mat translation_matrix = Mat::zeros(3, 1, CV_64F);
     mat_index.index->buildIndex();
 
     for (int iters_ = 0; iters_ < max_iters_; iters_++) {
