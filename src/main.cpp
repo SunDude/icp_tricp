@@ -4,7 +4,7 @@
 #include <ctime>
 #include <iostream>
 #include <Eigen/Dense>
-#include "MatrixReaderWriter.h"
+#include "./MatrixReaderWriter.h"
 #include <omp.h>
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/eigen.hpp>
@@ -23,6 +23,17 @@ typedef struct Trafo {
     Mat transl;
 } Trafo;
 #define PI 3.14159265
+
+class V3D {
+public:
+double x, y, z;
+V3D() { }
+V3D(double X, double Y, double Z) : x(X), y(Y), z(Z) { }
+};
+
+double TRIM_FACTOR = 0.4;
+
+std::fstream fsTICP;
 
 template <typename Der>
 void generateRandomPointCloud(MatrixBase<Der> &mat, const size_t N, const size_t dim, const typename Der::Scalar max_range = 10) {
@@ -53,27 +64,33 @@ void loadPointCloud(MatrixXd &mat1, MatrixXd &mat2, MatrixReaderWriter& mrw1, Ma
     cout << "Point cloud 2 loaded\n";
 }
 
-void findNearestNeighbours(Mat mat1, const my_kd_tree_t& mat_index, const size_t rowNum, const size_t columnNum) {
-  indices_.clear();
-  dists_.clear();
-  for (int i = 0; i < rowNum; ++i) {
-    // Query point:
-    vector<double> query_pt(columnNum);
-    for (size_t d = 0; d < columnNum; d++) {
-        query_pt[d] = mat1.at<double>(i, d);
+int findNearestNeighbours(Mat mat1, const my_kd_tree_t& mat_index, const size_t rowNum, const size_t columnNum) { 
+    // mat1, mat_index of mat2, rowNum = N of mat1, columnNum = 3 (3D)
+    // slow if mat1 is small and mat2 is big
+    indices_.clear();
+    dists_.clear();
+    int maxIdx = 0;
+    for (int i = 0; i < rowNum; ++i) {
+        // Query point:
+        vector<double> query_pt(columnNum);
+        for (size_t d = 0; d < columnNum; d++) {
+            query_pt[d] = mat1.at<double>(i, d);
+        }
+        // do a knn search
+        size_t ret_index;
+        double out_dist_sqr;
+
+        nanoflann::KNNResultSet<double> resultSet(1);
+        resultSet.init(&ret_index, &out_dist_sqr);
+
+        mat_index.index->findNeighbors(resultSet, &query_pt[0],nanoflann::SearchParams(10));
+
+        maxIdx = max(maxIdx, int(ret_index));
+        indices_.push_back(int(ret_index));
+        dists_.push_back(out_dist_sqr);
     }
-    // do a knn search
-    size_t ret_index;
-    double out_dist_sqr;
 
-    nanoflann::KNNResultSet<double> resultSet(1);
-    resultSet.init(&ret_index, &out_dist_sqr);
-
-    mat_index.index->findNeighbors(resultSet, &query_pt[0],nanoflann::SearchParams(10));
-
-    indices_.push_back(int(ret_index));
-    dists_.push_back(out_dist_sqr);
-  }
+    return maxIdx;
 }
 
 Trafo best_fit_transform(const Mat& pointcloud_1, const Mat& pointcloud_2) {
@@ -213,15 +230,74 @@ double calculateError(Mat mat1, Mat mat2, Mat rot, Mat transl) {
     return error;
 }
 
-double calculateTrimmedError (int NPo, vector<tuple<int, int, double>> pairedIndicesAndDistances) {
+double calculateTrimmedError (int NPo, vector<tuple<int, int, double>> pairedIndicesAndDistances, double threshold) {
     double trimmedMSE = 0.;
-    int length = NPo;
-    for (int i = 0; i < length; i++) {
-        trimmedMSE += get<2>(pairedIndicesAndDistances[i]);
+    int length = 0;
+    for (int i = 0; i < NPo; i++) {
+        double di = get<2>(pairedIndicesAndDistances[i]);
+        if (di > threshold) {
+            continue;
+        }
+        trimmedMSE += di;
+        length++;
     }
     trimmedMSE /= length;
     return trimmedMSE;
 }
+
+/*double calculateUniqTrimmedError (int NPo, vector<tuple<int, int, double>> pairedIndicesAndDistances, double threshold) {
+    sort(pairedIndicesAndDistances.begin(), pairedIndicesAndDistances.end());
+    double trimmedMSE = 0.;
+    int length = NPo;
+    int incLens = 0;
+
+    pair<int, int> bidx = make_pair(-1, -1);
+    double bdst = 1e12;
+
+    for (int i = 0; i < length; i++) {
+        pair<int, int> idxi = make_pair(get<0>(pairedIndicesAndDistances[i]), get<1>(pairedIndicesAndDistances[i]));
+        double dsti = get<2>(pairedIndicesAndDistances[i]);
+        if (i > 0) {
+            if ((bidx.first != idxi.first) || (i == length-1)) { // if from node changes
+                // changed idx, register if below threshold then rest best
+                if (dsti < threshold) {
+                    trimmedMSE += dsti;
+                    incLens++;
+                }
+                bidx = make_pair(-1, -1);
+                bdst = 1e12;
+            }
+        }
+        if (dsti < bdst) {
+            bidx = idxi;
+            bdst = dsti;
+        }
+    }
+    trimmedMSE /= incLens;
+    return trimmedMSE;
+}
+
+void makeUniqThresh(int n, vector<tuple<int, int, double>> &pID, double thresh) {
+    vector<bool> idxSet(n+1, false);
+    vector<tuple<int, int, double>> newpID;
+
+    for (int i=0; i<pID.size(); i++) {
+        int a = get<0>(pID[i]),
+            b = get<1>(pID[i]);
+        double di = get<2>(pID[i]);
+        if (!idxSet[a] && !idxSet[b]) {
+            // seen neither idx, skip
+            if (di < thresh) {
+                // within threshold
+                newpID.push_back(pID[i]);
+            }
+        }
+
+        idxSet[a] = idxSet[b] = true;
+    }
+
+    pID = newpID;
+}*/
 
 void icp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
     auto time_start = std::chrono::high_resolution_clock::now();
@@ -238,7 +314,7 @@ void icp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
     Mat rotation_matrix = Mat::eye(3, 3, CV_64F);
     Mat translation_matrix = Mat::zeros(3, 1, CV_64F);
     for (int iters_ = 0; iters_ < max_iters_; iters_++) {
-        findNearestNeighbours(cvSource, mat_index, cvSource.rows, 3);
+        int maxIdx = findNearestNeighbours(cvSource, mat_index, cvSource.rows, 3);
         Mat cvNewTarget = Mat::zeros(cvSource.rows, 3, CV_64F);
         for (int i = 0; i < cvSource.rows; i++) {
             cvNewTarget.at<double>(i, 0) = cvTarget.at<double>(indices_[i], 0);
@@ -261,7 +337,7 @@ void icp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
         }
 
         mean_error = calculateError(cvSource, cvNewTarget, T.rot, T.transl); // Updating MSE
-        cout << mean_error << endl;
+        cout << "MSE: " << mean_error << endl;
         if (abs(prev_error - mean_error) < tolerance) {
             break;
         }
@@ -272,7 +348,7 @@ void icp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
     cout << "Time = " << duration.count() << " s" << endl;
     cout << "Rotation matrix: " << endl << rotation_matrix << endl;
     cout << "Translation matrix: " << endl << translation_matrix << endl;
-    ofstream file("D:/source/repos/3dsens_icp/test.xyz");
+    ofstream file("C:/Users/quans/OneDrive/Documents/code/icp_tricp/test.xyz");
     if (file.is_open())
     {
         for (int i = 0; i < cvSource.rows; ++i) {
@@ -284,41 +360,69 @@ void icp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
     }
 }
 
-void tricp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
+void tricp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num, double threshold) {
     auto time_start = std::chrono::high_resolution_clock::now();
     Trafo T;
     Mat cvSource, cvTarget;
-    eigen2cv(mat1, cvSource);
-    eigen2cv(mat2, cvTarget);
+    bool swapSourceTarget = false;
+    if (mat1.rows() < mat2.rows()/4) {
+        swapSourceTarget = true; // if mat1 is much smaller than mat2, swap them and invert results
+        swap(mat1, mat2);
+    }
+    eigen2cv(mat1, cvSource); // cmp
+    eigen2cv(mat2, cvTarget); // ref
     double prev_error = 0.0;
     double mean_error = 0.0;
-    double tolerance = 0.0001;
+    double tolerance = 0.00001;
     int max_iters_ = max_iteration_num;//100;
-    my_kd_tree_t mat_index(3, std::cref(mat2), 10 /* max leaf */);
     Mat rotation_matrix = Mat::eye(3, 3, CV_64F);
     Mat translation_matrix = Mat::zeros(3, 1, CV_64F);
-    mat_index.index->buildIndex();
+    my_kd_tree_t matidx2(3, std::cref(mat2), 10 /* max leaf */);
+    matidx2.index->buildIndex();
 
     for (int iters_ = 0; iters_ < max_iters_; iters_++) {
         pairedIndicesAndDistances.clear();
-        findNearestNeighbours(cvSource, mat_index, cvSource.rows, 3); 
 
+        int maxIdx = 0;
+        maxIdx = findNearestNeighbours(cvSource, matidx2, cvSource.rows, 3); // this can be very slow if mat1 is small and mat2 is big
         for (int i = 0; i < cvSource.rows; i++) {
             pairedIndicesAndDistances.push_back(make_tuple(i, indices_[i], dists_[i]));
         }
 
         sort(pairedIndicesAndDistances.begin(), pairedIndicesAndDistances.end(), sortbythird);
-        sort(dists_.begin(), dists_.end());
-        int NPo = 0.6 * double(pairedIndicesAndDistances.size());
-        Mat cvNewSource = Mat::zeros(NPo, 3, CV_64F);
-        Mat cvNewTarget = Mat::zeros(NPo, 3, CV_64F);
+
+        int NPo = TRIM_FACTOR * double(pairedIndicesAndDistances.size());
+        vector<bool> refIdxB(maxIdx+1, false);
+        vector<V3D> src3, to3;
+
         for (int i = 0; i < NPo; i++) {
-            cvNewSource.at<double>(i, 0) = cvSource.at<double>(get<0>(pairedIndicesAndDistances[i]), 0);
-            cvNewSource.at<double>(i, 1) = cvSource.at<double>(get<0>(pairedIndicesAndDistances[i]), 1);
-            cvNewSource.at<double>(i, 2) = cvSource.at<double>(get<0>(pairedIndicesAndDistances[i]), 2);
-            cvNewTarget.at<double>(i, 0) = cvTarget.at<double>(get<1>(pairedIndicesAndDistances[i]), 0);
-            cvNewTarget.at<double>(i, 1) = cvTarget.at<double>(get<1>(pairedIndicesAndDistances[i]), 1);
-            cvNewTarget.at<double>(i, 2) = cvTarget.at<double>(get<1>(pairedIndicesAndDistances[i]), 2);
+            int a = get<0>(pairedIndicesAndDistances[i]),
+                b = get<1>(pairedIndicesAndDistances[i]);
+            double di = get<2>(pairedIndicesAndDistances[i]);
+
+            if (di > threshold) {
+                break;
+            }
+            if (!refIdxB[b]) {
+                src3.push_back(V3D(cvSource.at<double>(a, 0), cvSource.at<double>(a, 1), cvSource.at<double>(a, 2)));
+                to3.push_back(V3D(cvTarget.at<double>(b, 0), cvTarget.at<double>(b, 1), cvTarget.at<double>(b, 2)));
+                refIdxB[b] = true;
+            }
+            else {
+                pairedIndicesAndDistances[i] = make_tuple(a, b, threshold+1);
+            }
+        }
+        int newNPo = src3.size();
+        Mat cvNewSource = Mat::zeros(newNPo, 3, CV_64F);
+        Mat cvNewTarget = Mat::zeros(newNPo, 3, CV_64F);
+        
+        for (int i=0; i<newNPo; i++) {
+            cvNewSource.at<double>(i, 0) = src3[i].x;
+            cvNewSource.at<double>(i, 1) = src3[i].y;
+            cvNewSource.at<double>(i, 2) = src3[i].z;
+            cvNewTarget.at<double>(i, 0) = to3[i].x;
+            cvNewTarget.at<double>(i, 1) = to3[i].y;
+            cvNewTarget.at<double>(i, 2) = to3[i].z;
         }
 
         T = best_fit_transform(cvNewSource, cvNewTarget); // For !!!! Npo selected pairs !!!!, compute optimal motion(R, t) that minimises STS
@@ -335,8 +439,7 @@ void tricp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
             cvSource.at<double>(i, 1) = pont.at<double>(1, 0);
             cvSource.at<double>(i, 2) = pont.at<double>(2, 0);
         }
-        // mean_error = calculateError(cvSource, cvNewTarget, T.rot, T.transl); // Updating MSE
-        mean_error = calculateTrimmedError(NPo, pairedIndicesAndDistances); // Updating MSE
+        mean_error = calculateTrimmedError(NPo, pairedIndicesAndDistances, threshold); // Updating MSE
         cout << "MSE: " << mean_error << endl;
 
         if (abs(prev_error - mean_error) < tolerance) {
@@ -344,30 +447,59 @@ void tricp(MatrixXd mat1, MatrixXd mat2, int max_iteration_num) {
         }
         prev_error = mean_error;
     }
+    if (swapSourceTarget) {
+        // invert rot and trans
+        rotation_matrix = rotation_matrix.t();
+        translation_matrix = translation_matrix * -1.0f;
+    }
     auto time_finish = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> duration = (time_finish - time_start);
     cout << "Time = " << duration.count() << " s" << endl;
     cout << "Rotation matrix: " << endl << rotation_matrix << endl;
-    cout << "Translation matrix: " << endl << translation_matrix << endl;
-    ofstream file("D:/source/repos/3dsens_icp/test_trimmed.xyz");
-    if (file.is_open())
-    {
-        for (int i = 0; i < cvSource.rows; ++i) {
-            file << cvSource.at<double>(i, 0) << " " << cvSource.at<double>(i, 1) << " " << cvSource.at<double>(i, 2) << endl;
+    for (int i=0; i<3; i++) {
+        for (int j=0; j<3; j++) {
+            fsTICP << rotation_matrix.at<double>(i, j) << (j==2 ? "" : " ");
         }
-        for (int i = 0; i < cvTarget.rows; ++i) {
-            file << cvTarget.at<double>(i, 0) << " " << cvTarget.at<double>(i, 1) << " " << cvTarget.at<double>(i, 2) << endl;
-        }
+        fsTICP << std::endl;
     }
+    cout << "Translation matrix: " << endl << translation_matrix << endl;
+    for (int i=0; i<3; i++) {
+        for (int j=0; j<1; j++) {
+            fsTICP << translation_matrix.at<double>(i, j);
+        }
+        fsTICP << std::endl;
+    }
+    // ofstream file("test_trimmed.xyz");
+    // if (file.is_open())
+    // {
+    //     for (int i = 0; i < cvSource.rows; ++i) {
+    //         file << cvSource.at<double>(i, 0) << " " << cvSource.at<double>(i, 1) << " " << cvSource.at<double>(i, 2) << endl;
+    //     }
+    //     for (int i = 0; i < cvTarget.rows; ++i) {
+    //         //file << cvTarget.at<double>(i, 0) << " " << cvTarget.at<double>(i, 1) << " " << cvTarget.at<double>(i, 2) << endl;
+    //     }
+    // }
+}
+
+void removeRow(Eigen::MatrixXd& matrix, unsigned int rowToRemove)
+{
+    unsigned int numRows = matrix.rows()-1;
+    unsigned int numCols = matrix.cols();
+
+    if( rowToRemove < numRows )
+        matrix.block(rowToRemove,0,numRows-rowToRemove,numCols) = matrix.block(rowToRemove+1,0,numRows-rowToRemove,numCols);
+
+    matrix.conservativeResize(numRows,numCols);
 }
 
 int main(int argc, char **argv) {
   // Randomize Seed
   srand(static_cast<unsigned int>(time(nullptr)));
-  if (argc < 3) {
-      std::cerr << "Usage: " << argv[0] << " XYZ1 XYZ2 MAX_ITER" << std::endl;
+  if (argc < 4) {
+      std::cerr << "Usage: " << argv[0] << " TOALIGNXYZ REFXYZ TOL_LVL(0,1] MAX_ITER THRESHOLD" << std::endl;
       return 1;
   }
+  fsTICP = std::fstream("TICPresult.txt", std::ios::out | std::ios::trunc);
   MatrixReaderWriter* mrw1;
   mrw1 = new MatrixReaderWriter(argv[1]);
   MatrixReaderWriter* mrw2;
@@ -376,27 +508,36 @@ int main(int argc, char **argv) {
   MatrixXd mat2(mrw2->rowNum, mrw2->columnNum);
   loadPointCloud(mat1, mat2, *mrw1, *mrw2);
 
-  int max_iteration_num = atoi(argv[3]);
+  TRIM_FACTOR = atof(argv[3]);
+  if (TRIM_FACTOR < 0.01 || TRIM_FACTOR > 1.0) {
+      std::cerr << "TOL_LVL must be in range (0, 1]" << std::endl;
+      return 1;
+  }
+
+  int max_iteration_num = atoi(argv[4]);
+  double threshold = atof(argv[5]);
 
   // Iterative Closest Point Algorithm
-  icp(mat1, mat2, max_iteration_num);
+  // icp(mat1, mat2, max_iteration_num);
+
+//   cout << "ICP done" << endl;
 
   // Trimmed Iterative Closest Point Algorithm
-  tricp(mat1, mat2, max_iteration_num); // mat1 is data, mat2 is the model
+  tricp(mat1, mat2, max_iteration_num, threshold); // mat1 is data, mat2 is the model
 
-  //vector<double> degrees = { 0, 0, 20 * PI / 180.0 };
-  //Matrix3d initialRotation = eulerAnglesToRotationMatrix(degrees);
+  /*vector<double> degrees = { 0, 0, 20 * PI / 180.0 };
+  Matrix3d initialRotation = eulerAnglesToRotationMatrix(degrees);
   //cout << initialRotation;
-  //#pragma omp parallel for
-  //for (int i = 0; i < mat1.rows(); i++) {      
-  //    mat1.block<1, 3>(i, 0).transpose() << initialRotation * mat1.block<1, 3>(i, 0).transpose();
-  //}
+  #pragma omp parallel for
+  for (int i = 0; i < mat1.rows(); i++) {      
+      mat1.block<1, 3>(i, 0).transpose() << initialRotation * mat1.block<1, 3>(i, 0).transpose();
+  }*/
 
-  //ofstream file("D:/source/repos/3dsens_icp/LionScan1_rotated_20.xyz");
-  //if (file.is_open())
-  //{
-  //    file << mat1 << '\n';
-  //}
+//   ofstream file("C:/Users/quans/OneDrive/Documents/code/icp_tricp/out.xyz");
+//   if (file.is_open())
+//   {
+//       file << mat1 << '\n';
+//   }
 
   return 0;
 }
